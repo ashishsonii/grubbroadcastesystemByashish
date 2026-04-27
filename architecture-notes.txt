@@ -1,0 +1,400 @@
+============================================================
+CONTENT BROADCASTING SYSTEM — ARCHITECTURE NOTES
+============================================================
+Author: Engineering Team
+Date: April 2026
+
+This document provides comprehensive architectural documentation
+for the Content Broadcasting System backend.
+
+============================================================
+1. AUTHENTICATION & RBAC FLOW
+============================================================
+
+JWT Issuance on Login:
+- When a user logs in via POST /api/auth/login, their email and
+  password are validated against the database.
+- Password comparison uses bcrypt.compare() against the stored
+  password_hash (hashed with saltRounds=10).
+- On successful validation, a JWT is generated using jsonwebtoken
+  with payload: { id, email, role }.
+- The JWT is signed with the JWT_SECRET environment variable and
+  set to expire in 24 hours (configurable via JWT_EXPIRES_IN).
+- The token is returned in the response body for the client to
+  store and include in subsequent requests.
+
+Token Verification Middleware Chain:
+- The auth.middleware.js extracts the Bearer token from the
+  Authorization header.
+- It verifies the token using jwt.verify() with the same
+  JWT_SECRET used during signing.
+- On success, the decoded payload (id, email, role) is attached
+  to req.user for downstream middleware and controllers.
+- On failure (expired, malformed, missing), a 401 response is
+  returned immediately, short-circuiting the request.
+
+Role Enforcement via requireRole Middleware:
+- The rbac.middleware.js exports a requireRole(...roles) function
+  that returns an Express middleware.
+- It checks if req.user.role (set by auth middleware) is included
+  in the allowed roles array.
+- If not authorized, a 403 Forbidden response is returned.
+- This middleware is always placed AFTER auth.middleware in the
+  route chain to ensure req.user exists.
+
+How Principal vs Teacher Routes Are Protected:
+- Teacher-only routes (e.g., POST /api/content/upload, GET /api/content/my)
+  use: authenticate → requireRole('teacher') → controller
+- Principal-only routes (e.g., GET /api/approval/pending, PATCH approve/reject)
+  use: authenticate → requireRole('principal') → controller
+- Some routes allow both roles (not currently used but supported via
+  requireRole('teacher', 'principal'))
+- Public routes (GET /api/content/live/:teacherId) skip auth entirely.
+
+============================================================
+2. SUBJECT-BASED SYSTEM DESIGN
+============================================================
+
+ContentSlot as the Container:
+- A ContentSlot represents a unique (subject, teacher_id) pair.
+- It acts as a logical container that groups all content uploaded
+  by a specific teacher for a specific subject.
+- Example: Teacher "Ravi" teaching "maths" has one ContentSlot.
+  All his maths content is scheduled within this slot.
+
+ContentSchedule as the Ordered Schedule:
+- Each ContentSchedule record links a specific Content item to
+  a ContentSlot with a rotation_order and duration.
+- rotation_order determines the sequence in which content
+  appears during rotation (1, 2, 3...).
+- duration (in minutes) determines how long each content item
+  is displayed before rotating to the next.
+- New content is automatically assigned the next rotation_order
+  value (max existing + 1) for its slot.
+
+Why This Design Supports Multiple Teachers Independently:
+- Since ContentSlots are scoped to (subject, teacher_id), each
+  teacher has their own independent rotation schedule per subject.
+- Teacher A's maths content rotates independently of Teacher B's
+  maths content.
+- The live endpoint filters by teacherId first, then groups by
+  subject, ensuring complete isolation between teachers.
+- This design also allows easy scaling: adding a new teacher
+  requires no changes to existing data or logic.
+
+============================================================
+3. CONTENT LIFECYCLE (UPLOAD TO APPROVAL)
+============================================================
+
+Multer Configuration Choices:
+- Storage: diskStorage with destination set to ./uploads/
+- Filename: Prefixed with Date.now() to prevent collisions,
+  original filename is sanitized (special chars replaced with _)
+- This ensures uniqueness even if two files have the same name.
+
+File Validation (Type + Size) Before DB Write:
+- fileFilter checks MIME type against allowed list:
+  image/jpeg, image/png, image/gif
+- If invalid type, multer throws an error caught by the global
+  error handler, returning a 400 response.
+- limits.fileSize is set to 10MB (10 * 1024 * 1024 bytes).
+- If file exceeds limit, multer throws LIMIT_FILE_SIZE error,
+  also caught by the global error handler with a 400 response.
+- These checks happen BEFORE any database operation, ensuring
+  no orphaned records on file validation failure.
+
+Local Storage Path Convention:
+- Files are stored in the /uploads/ directory at project root.
+- The file_url stored in the database is: /uploads/<filename>
+- This path is relative to the static file server mount point.
+
+How file_url Is Stored and Served:
+- In app.js: express.static serves the uploads directory at /uploads
+- A file at ./uploads/1714200000000-image.jpg is accessible at
+  http://localhost:3000/uploads/1714200000000-image.jpg
+- The Content record's file_url field stores the path as
+  "/uploads/1714200000000-image.jpg" for consistent URL construction.
+
+============================================================
+4. APPROVAL WORKFLOW DESIGN
+============================================================
+
+Status Machine: pending → approved/rejected:
+- Content is created with status='pending' by default.
+- Only two valid transitions exist:
+  a) pending → approved (via PATCH /:contentId/approve)
+  b) pending → rejected (via PATCH /:contentId/reject)
+- Already approved or rejected content cannot be re-processed.
+  Attempting to do so returns a 400 error.
+- This is a one-way state machine — there is no path back to
+  'pending' from 'approved' or 'rejected'.
+
+Only Principal Can Transition States:
+- Both approve and reject endpoints are protected with
+  authenticate → requireRole('principal').
+- The approved_by field records which principal approved the
+  content, providing an audit trail.
+- approved_at timestamp records when the approval occurred.
+
+Rejection Requires Reason:
+- The reject endpoint requires a 'reason' field in the body.
+- The reason must be at least 10 characters long (enforced by
+  both express-validator and controller-level validation).
+- If missing or too short, a 400 response is returned.
+- The rejection_reason is stored in the content record for
+  the teacher to see why their content was rejected.
+
+Approved Content Is Still Gated by Time Window:
+- Even after approval, content only appears in the live broadcast
+  if NOW() is between start_time and end_time.
+- This means a principal can approve content in advance, and it
+  will only become visible when its scheduled window starts.
+- This design separates approval (quality gate) from scheduling
+  (time-based visibility).
+
+============================================================
+5. SCHEDULING/ROTATION LOGIC (MOST DETAILED SECTION)
+============================================================
+
+Epoch-Based Rotation Algorithm — Step by Step:
+
+Overview:
+The scheduling algorithm is completely stateless. It requires no
+cron jobs, no timers, and no background processes. The currently
+active content is computed purely from the current time and the
+metadata stored in the database.
+
+Step 1: Sort by rotation_order
+- All content items for a given subject/teacher combination are
+  sorted by their content_schedule.rotation_order in ascending order.
+- This establishes the playback sequence: order 1, then 2, then 3, etc.
+
+Step 2: Calculate total_cycle_duration
+- Sum all durations (in minutes) from the sorted list.
+- Convert to milliseconds: total_ms = total_minutes * 60 * 1000
+- Example with 3 items of 5 minutes each: total = 15 minutes = 900000ms
+
+Step 3: Determine the epoch
+- The epoch is the reference start time for the rotation cycle.
+- We use the earliest start_time among all content items in the list.
+- This ensures the rotation begins when the first content becomes visible.
+
+Step 4: Calculate elapsed time
+- elapsed_ms = currentTime - epoch (both as milliseconds)
+- This gives us the total time that has passed since the rotation started.
+
+Step 5: Determine position within current cycle
+- position = elapsed_ms % total_cycle_duration
+- The modulo operation creates the continuous looping behavior.
+- Example: At 16 minutes with a 15-minute cycle, position = 1 minute
+  (we're 1 minute into the second cycle).
+
+Step 6: Walk through sorted list
+- Initialize accumulated = 0
+- For each item in sorted order:
+  - Add its duration (in ms) to accumulated
+  - If accumulated > position, this item is currently active
+  - Return that item
+- This maps the position to a specific content item.
+
+Example Walkthrough:
+- Content A: order=1, duration=5min (0ms–300000ms)
+- Content B: order=2, duration=5min (300000ms–600000ms)
+- Content C: order=3, duration=5min (600000ms–900000ms)
+- Total cycle = 900000ms (15 minutes)
+- At t=0 minutes: position=0 → A is active (accumulated 300000 > 0)
+- At t=6 minutes: position=360000 → B (accumulated 300000 < 360000, 
+  then 600000 > 360000 → B)
+- At t=12 minutes: position=720000 → C (accumulated 600000 < 720000,
+  then 900000 > 720000 → C)
+- At t=16 minutes: position=60000 → A again (new cycle, 300000 > 60000)
+
+Edge Case Handling:
+
+1. Empty list:
+   - If contentList is empty or null, return null immediately.
+   - The controller returns { message: "No content available", data: null }
+
+2. Single item:
+   - If only one content item exists, return it directly.
+   - No rotation calculation needed — it's always active.
+
+3. All items have duration=0:
+   - Each item with duration ≤ 0 is treated as having duration=5 (default).
+   - This prevents division by zero in the modulo operation.
+
+4. Epoch is in the future:
+   - If elapsed_ms is negative (epoch hasn't arrived yet), return null.
+   - Content hasn't started broadcasting yet.
+
+Why This Is Stateless (No Cron Jobs Needed):
+- The algorithm is purely computational — given the current time
+  and the schedule metadata, it deterministically computes which
+  content is active.
+- No state is stored about "current position" or "last rotated at".
+- Every request to GET /api/content/live/:teacherId re-computes
+  the active content from scratch.
+- This means the system works correctly even after server restarts,
+  with no missed rotations or inconsistent state.
+- The trade-off is a small computational cost per request, which
+  is negligible for the expected load.
+
+============================================================
+6. DATABASE DESIGN DECISIONS
+============================================================
+
+UUID vs Integer PKs — Why UUID:
+- UUIDs provide globally unique identifiers without sequential
+  patterns, improving security (no enumerable IDs).
+- They allow distributed ID generation without coordination.
+- They prevent information leakage about record counts.
+- Trade-off: Slightly larger storage and slower indexing compared
+  to integers, but acceptable for this use case.
+
+Why content_slots and content_schedule Are Separate Tables:
+- ContentSlot groups content by (subject, teacher_id) — it's a
+  structural container.
+- ContentSchedule stores per-content scheduling metadata
+  (rotation_order, duration) — it's operational data.
+- Separating them allows:
+  a) Easy querying of all slots for a teacher
+  b) Independent management of schedule ordering
+  c) Future features like slot-level settings (e.g., max items)
+  d) Clean normalization avoiding data duplication
+
+Foreign Key Relationships and Cascade Behavior:
+- users → content (uploaded_by): CASCADE on delete
+  (deleting a user removes their content)
+- users → content (approved_by): SET NULL on delete
+  (deleting the approving principal preserves the content)
+- users → content_slots (teacher_id): CASCADE on delete
+- content_slots → content_schedule (slot_id): CASCADE on delete
+- content → content_schedule (content_id): CASCADE on delete
+
+Index Recommendations (Implemented):
+- content.uploaded_by — fast lookup of teacher's content
+- content.status — fast filtering by approval status
+- content.subject — fast subject-based queries
+- content.approved_by — audit trail queries
+- content.(start_time, end_time) — time window filtering
+- content_slots.(subject, teacher_id) — unique constraint + fast lookup
+- content_schedule.(slot_id, rotation_order) — rotation queries
+
+============================================================
+7. FOLDER STRUCTURE RATIONALE
+============================================================
+
+Controllers vs Services Separation:
+- Controllers handle HTTP concerns: request parsing, validation
+  result checking, response formatting.
+- Services handle business logic: database operations, algorithm
+  execution, data transformation.
+- This separation enables:
+  a) Unit testing services without HTTP mocking
+  b) Reusing business logic across different routes
+  c) Cleaner, more focused code in each layer
+
+Why Utils Are Isolated:
+- Utils contain pure, reusable functions with no dependencies
+  on Express, database, or business logic.
+- response.util.js: Ensures consistent API response format
+  across all controllers.
+- scheduler.util.js: Provides low-level calculation functions
+  used by the scheduling service.
+- This isolation makes them easy to test and reason about.
+
+Config Folder Purpose:
+- Centralizes all external configuration (database, multer).
+- Reads from environment variables with sensible defaults.
+- Makes it easy to swap implementations (e.g., switching from
+  local storage to S3 only requires changing multer config).
+
+============================================================
+8. MIDDLEWARE USAGE
+============================================================
+
+Order of Middleware in Express Pipeline:
+1. cors() — Handle CORS headers before anything else
+2. morgan('dev') — Log every request for debugging
+3. express.json() — Parse JSON request bodies
+4. express.urlencoded() — Parse URL-encoded bodies
+5. express.static() — Serve uploaded files
+6. Route handlers — Application logic
+7. 404 handler — Catch unknown routes
+8. errorHandler — Global error handler (must be last)
+
+Auth → RBAC → Upload → Controller Chain:
+- For protected upload routes, the middleware chain is:
+  1. authenticate (auth.middleware) — Verify JWT, attach req.user
+  2. requireRole('teacher') (rbac.middleware) — Check role
+  3. uploadSingle (upload.middleware) — Process file upload via multer
+  4. Validation (express-validator) — Validate body fields
+  5. Controller function — Execute business logic
+- Each middleware can short-circuit the chain by sending a response.
+- Errors thrown by any middleware are caught by the global handler.
+
+Error Handler Placement:
+- Must be the LAST app.use() call in Express.
+- Has 4 parameters (err, req, res, next) — Express recognizes
+  this signature as an error-handling middleware.
+- Catches: Multer errors (400), JWT errors (401), Sequelize
+  validation errors (422), unique constraint errors (409),
+  and generic errors (500).
+
+============================================================
+9. SCALABILITY APPROACH
+============================================================
+
+How Redis Caching is implemented for /content/live:
+- The live endpoint is read-heavy and the active content changes
+  at most every few minutes (based on duration).
+- Strategy implemented: We use `ioredis` to cache the computed active
+  content per (teacherId, subject) with a 15-second TTL.
+- Cache-aside pattern: The controller first checks `live_content:teacherId:subject`.
+  If it's a hit, it returns the data instantly. If it's a miss, it computes
+  the schedule, stores the result in Redis with `setex`, and returns it.
+- **Graceful Degradation (Edge Case Handling)**: The Redis get/set operations
+  are wrapped in try-catch blocks. Additionally, `ioredis` is configured
+  with `enableOfflineQueue: false`. If the Redis instance crashes or
+  experiences downtime, the application will not hang. It will log a warning
+  and seamlessly fall back to querying the PostgreSQL database, ensuring
+  100% uptime for students.
+- This effectively prevents database hammering while keeping content fresh.
+
+Rate Limiting Strategy for Public Endpoint:
+- Currently implemented: 100 requests per 15 minutes per IP
+  using express-rate-limit.
+- For higher scale: Use a Redis-backed rate limiter
+  (rate-limit-redis) for distributed rate limiting across
+  multiple server instances.
+- Consider tiered limits: Stricter for anonymous users,
+  more generous for authenticated integrations.
+
+S3/R2 Cloud Storage (Implemented):
+- Storage is powered by Cloudflare R2 (S3-compatible) using @aws-sdk/client-s3
+  and multer-s3.
+- The system auto-detects storage mode at startup based on env vars:
+  if R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, and R2_BUCKET_NAME
+  are all set, it uses R2. Otherwise, it falls back to local ./uploads/ disk.
+- Files are uploaded directly to the R2 bucket via the S3-compatible endpoint:
+  https://<account_id>.r2.cloudflarestorage.com
+- The file_url stored in the database uses R2_PUBLIC_URL (the public CDN URL),
+  NOT the internal S3 endpoint. This ensures files are accessible to students
+  at a fast, publicly reachable URL.
+- File naming: uploads/<timestamp>-<sanitized_original_name>
+- No changes were needed in controllers — only config/multer.js and
+  services/content.service.js were updated, keeping the architecture clean.
+
+Horizontal Scaling Considerations (Stateless JWT):
+- JWT authentication is inherently stateless — no session storage
+  required. Any server instance can validate any token.
+- The scheduling algorithm is also stateless — no in-memory state
+  between requests. Any instance computes the same result.
+- Database is the only shared state, managed by PostgreSQL with
+  connection pooling (Sequelize pool config).
+- For horizontal scaling:
+  1. Run multiple Node.js instances behind a load balancer
+  2. Use a shared PostgreSQL database (or read replicas)
+  3. Add Redis for caching and rate limiting coordination
+  4. Use S3 for file storage instead of local disk
+  5. Consider PM2 or Kubernetes for process management
