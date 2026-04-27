@@ -2,6 +2,14 @@
 
 A backend system for managing and broadcasting educational content. Teachers upload subject-based content, principals approve it, and students access it through a public API that automatically rotates the active content based on time. Built with Node.js, Express, PostgreSQL, and Sequelize.
 
+## 🚀 Live Demo (Deployed API)
+
+- **Base URL:** `https://grubbroadcastesystembyashish.onrender.com`
+- **Health Check:** `https://grubbroadcastesystembyashish.onrender.com/api/health`
+- **Live Broadcast Example:** `https://grubbroadcastesystembyashish.onrender.com/api/content/live/<teacherId>`
+
+> **Note:** The Postman collection is pre-configured to use `http://localhost:3000` as the `base_url`. To test the live deployment, simply change the `base_url` variable in Postman to `https://grubbroadcastesystembyashish.onrender.com`.
+
 ## Tech Stack
 
 | Technology | Purpose |

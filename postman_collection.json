@@ -43,10 +43,10 @@
               "listen": "test",
               "script": {
                 "exec": [
-                  "if (pm.response.code === 200) {",
-                  "    var jsonData = pm.response.json();",
-                  "    pm.environment.set(\"token\", jsonData.data.token);",
-                  "    pm.environment.set(\"teacherId\", jsonData.data.user.id);",
+                  "const res = pm.response.json();",
+                  "pm.environment.set(\"token\", res.data.token);",
+                  "if (res.data.user.role === \"teacher\") {",
+                  "    pm.environment.set(\"teacherId\", res.data.user.id);",
                   "}"
                 ],
                 "type": "text/javascript"
@@ -86,9 +86,10 @@
               "listen": "test",
               "script": {
                 "exec": [
-                  "if (pm.response.code === 200) {",
-                  "    var jsonData = pm.response.json();",
-                  "    pm.environment.set(\"token\", jsonData.data.token);",
+                  "const res = pm.response.json();",
+                  "pm.environment.set(\"token\", res.data.token);",
+                  "if (res.data.user.role === \"teacher\") {",
+                  "    pm.environment.set(\"teacherId\", res.data.user.id);",
                   "}"
                 ],
                 "type": "text/javascript"
@@ -161,7 +162,7 @@
                 },
                 {
                   "key": "end_time",
-                  "value": "2025-01-01T00:00:00.000Z",
+                  "value": "2027-01-01T00:00:00.000Z",
                   "type": "text"
                 },
                 {
@@ -191,7 +192,7 @@
           "response": []
         },
         {
-          "name": "My Content",
+          "name": "My Content (Teacher)",
           "request": {
             "method": "GET",
             "header": [
@@ -201,14 +202,48 @@
               }
             ],
             "url": {
-              "raw": "{{base_url}}/api/content/my-content",
+              "raw": "{{base_url}}/api/content/my",
               "host": [
                 "{{base_url}}"
               ],
               "path": [
                 "api",
                 "content",
-                "my-content"
+                "my"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "All Content (Principal)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/content/all?page=1&limit=10",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "content",
+                "all"
+              ],
+              "query": [
+                {
+                  "key": "page",
+                  "value": "1"
+                },
+                {
+                  "key": "limit",
+                  "value": "10"
+                }
               ]
             }
           },
@@ -292,7 +327,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n    \"rejection_reason\": \"Inappropriate content\"\n}"
+              "raw": "{\n    \"reason\": \"Content quality does not meet standards. Please re-upload with better resolution.\"\n}"
             },
             "url": {
               "raw": "{{base_url}}/api/approval/:contentId/reject",
@@ -335,6 +370,53 @@
                 "content",
                 "live",
                 "{{teacherId}}"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Health Check",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/health",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "health"
+              ]
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Analytics",
+      "item": [
+        {
+          "name": "Subject Analytics",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/analytics/subjects",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "analytics",
+                "subjects"
               ]
             }
           },

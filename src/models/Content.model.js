@@ -77,11 +77,11 @@ module.exports = (sequelize) => {
     },
     start_time: {
       type: DataTypes.DATE,
-      allowNull: false,
+      allowNull: true,
     },
     end_time: {
       type: DataTypes.DATE,
-      allowNull: false,
+      allowNull: true,
     },
   }, {
     tableName: 'content',

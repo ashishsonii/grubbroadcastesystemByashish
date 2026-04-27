@@ -44,10 +44,10 @@ router.post(
     body('subject')
       .notEmpty().withMessage('Subject is required.'),
     body('start_time')
-      .notEmpty().withMessage('start_time is required.')
+      .optional()
       .isISO8601().withMessage('start_time must be a valid ISO datetime.'),
     body('end_time')
-      .notEmpty().withMessage('end_time is required.')
+      .optional()
       .isISO8601().withMessage('end_time must be a valid ISO datetime.'),
     body('rotation_duration')
       .optional()

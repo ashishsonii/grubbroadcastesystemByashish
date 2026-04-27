@@ -37,8 +37,8 @@ const createContent = async ({ title, description, subject, start_time, end_time
     file_size: file.size,
     uploaded_by: userId,
     status: 'pending',
-    start_time: new Date(start_time),
-    end_time: new Date(end_time),
+    start_time: start_time ? new Date(start_time) : null,
+    end_time: end_time ? new Date(end_time) : null,
   });
 
   // 2. Find or create ContentSlot for (subject, teacher_id)
